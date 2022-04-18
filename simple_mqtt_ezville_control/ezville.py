@@ -21,7 +21,7 @@ RS485_DEVICE = {
         "state":    { "id": "36", "cmd": "81" },
         
         "power":    { "id": "36", "cmd": "43", "ack": "C3" },
-        "away":    { "id": "36", "cmd": "45", "ack": "00" },
+        "away":    { "id": "36", "cmd": "45", "ack": "C5" },
         "target":   { "id": "36", "cmd": "44", "ack": "C4" }
     },
     "plug": {
@@ -69,10 +69,8 @@ DISCOVERY_PAYLOAD = {
         "temp_stat_t": "~/setTemp/state",
         "temp_cmd_t": "~/setTemp/command",
         "curr_temp_t": "~/curTemp/state",
-# 외출 모드는 fan_only로 매핑
-#        "away_mode_stat_t": "~/away/state",
-#        "away_mode_cmd_t": "~/away/command",
-        "modes": [ "off", "heat"],
+#        "modes": [ "off", "heat", "fan_only" ],     # 외출 모드는 fan_only로 매핑
+        "modes": [ "heat", "off" ],     # 외출 모드는 fan_only로 매핑
         "min_temp": "5",
         "max_temp": 40
     } ],
@@ -143,6 +141,7 @@ STATE_HEADER = {
     if 'state' in prop
 }
 
+# ACK 확인용 Dictionary
 ACK_HEADER = {
     prop[cmd]['id']: (device, prop[cmd]['ack'])
     for device, prop in RS485_DEVICE.items()
@@ -204,7 +203,7 @@ def ezville_loop(config):
     CMD_QUEUE = []
     
     # 기존 STATE 저장용 공간
-    HOMESTATE = {}
+    DEVICE_STATE = {}
     
     # 이전에 전달된 패킷인지 판단을 위한 캐쉬
     MSG_CACHE = {}
@@ -237,25 +236,45 @@ def ezville_loop(config):
     STATE_LOOP_DELAY = config['state_loop_delay']
     COMMAND_LOOP_DELAY = config['command_loop_delay']
     SERIAL_RECV_DELAY = config['serial_recv_delay']
+    RESTART_CHECK_DELAY = config['restart_check_delay']
     
     # EW11에 설정된 BUFFER SIZE
     EW11_BUFFER_SIZE = config['ew11_buffer_size']
     
     # EW11 동작상태 확인용 메시지 수신 시간 체크 주기 및 체크용 시간 변수
     EW11_TIMEOUT = config['ew11_timeout']
-    last_received_time = 0
+    last_received_time = time.time()
+    
+    # EW11 재시작 확인용 Flag
+    restart_flag = False
+  
+    # MQTT Integration 활성화 확인 Flag
+    MQTT_ONLINE = False
+    
+    # Addon 정상 시작 Flag
+    ADDON_STARTED = False
+ 
+    # Reboot 연관 제어 Flag
+    REBOOT_CONTROL = config['reboot_control']
+    REBOOT_DELAY = config['reboot_delay']
 
+    # 시작 시 인위적인 Delay 필요시 사용
+    startup_delay = 0
+   
     
     def on_connect(client, userdata, flags, rc):
         nonlocal comm_mode
         if rc == 0:
             log("[INFO] MQTT Broker 연결 성공")
+            # Socket인 경우 MQTT 장치의 명령 관련과 MQTT Status (Birth/Last Will Testament) Topic만 구독
             if comm_mode == 'socket':
-                client.subscribe(HA_TOPIC + '/#', 0)
+                client.subscribe([(HA_TOPIC + '/#', 0), ('homeassistant/status', 0)])
+            # Mixed인 경우 MQTT 장치 및 EW11의 명령/수신 관련 Topic 과 MQTT Status (Birth/Last Will Testament) Topic 만 구독
             elif comm_mode == 'mixed':
-                client.subscribe([(HA_TOPIC + '/#', 0), (EW11_TOPIC + '/recv', 0)])
+                client.subscribe([(HA_TOPIC + '/#', 0), (EW11_TOPIC + '/recv', 0), ('homeassistant/status', 0)])
+            # MQTT 인 경우 모든 Topic 구독
             else:
-                client.subscribe([(HA_TOPIC + '/#', 0), (EW11_TOPIC + '/recv', 0), (EW11_TOPIC + '/send', 1)])
+                client.subscribe([(HA_TOPIC + '/#', 0), (EW11_TOPIC + '/recv', 0), (EW11_TOPIC + '/send', 1), ('homeassistant/status', 0)])
         else:
             errcode = {1: 'Connection refused - incorrect protocol version',
                        2: 'Connection refused - invalid client identifier',
@@ -267,8 +286,31 @@ def ezville_loop(config):
 
     def on_message(client, userdata, msg):
         nonlocal MSG_QUEUE
+        nonlocal MQTT_ONLINE
+        nonlocal REBOOT_CONTROL
+        nonlocal REBOOT_DELAY
+        nonlocal startup_delay
+        
         MSG_QUEUE.put(msg)
  
+        # MQTT Integration의 Birth/Last Will Testament Topic은 바로 처리
+        if REBOOT_CONTROL:
+            if msg.topic == 'homeassistant/status':
+                status = msg.payload.decode('utf-8')
+                if status == 'online':
+                    log('[INFO] MQTT Integration Online')
+                    MQTT_ONLINE = True
+                    if not msg.retain:
+                        startup_delay = REBOOT_DELAY
+                elif status == 'offline':
+                    log('[INFO] MQTT Integration Offline')
+                    MQTT_ONLINE = False
+ 
+
+    def on_disconnect(client, userdata, rc):
+        log('INFO: MQTT 연결 해제')
+        pass
+
 
     # MQTT message를 분류하여 처리
     async def process_message():
@@ -289,7 +331,7 @@ def ezville_loop(config):
                 elif topics[0] == EW11_TOPIC and topics[-1] == 'recv':
                     # Que에서 확인된 시간 기준으로 EW11 Health Check함.
                     last_received_time = time.time()
-                    
+
                     await EW11_process(msg.payload.hex().upper())
                    
     
@@ -385,6 +427,9 @@ def ezville_loop(config):
                                 # room의 조절기 수 (현재 하나 뿐임)
                                 src = 1
                                 
+                                onoff_state = bin(int(packet[12:14], 16))[2:].zfill(8)
+                                away_state = bin(int(packet[14:16], 16))[2:].zfill(8)
+                                
                                 for rid in range(1, rc + 1):
                                     discovery_name = "{}_{:0>2d}_{:0>2d}".format(name, rid, src)
                                     
@@ -401,9 +446,15 @@ def ezville_loop(config):
                                     
                                     setT = packet[16 + 4 * rid:18 + 4 * rid]
                                     curT = packet[18 + 4 * rid:20 + 4 * rid]
-                                    onoff = 'heat' if int(packet[12:14], 16) & 0x1F >> (rc - rid) & 1 else 'off'
-                                    if onoff == 'off' and int(packet[14:16], 16) & 0x1F >> (rc - rid) & 1:
-                                        onoff = 'fan_only'
+                                    
+                                    if onoff_state[8 - rid ] == '1':
+                                        onoff = 'heat'
+                                    elif onoff_state[8 - rid] == '0' and away_state[8 - rid] == '1':
+                                        onoff = 'off'
+#                                    elif onoff_state[8 - rid] == '0' and away_state[8 - rid] == '0':
+#                                        onoff = 'off'
+#                                    else:
+#                                        onoff = 'off'
 
                                     await update_state(name, 'power', rid, src, onoff)
                                     await update_temperature(name, rid, src, curT, setT)
@@ -543,13 +594,13 @@ def ezville_loop(config):
 
                                                                                     
     async def update_state(device, state, id1, id2, onoff):
-        nonlocal HOMESTATE
+        nonlocal DEVICE_STATE
         nonlocal FORCE_UPDATE
         deviceID = "{}_{:0>2d}_{:0>2d}".format(device, id1, id2)
         key = deviceID + state
         
-        if onoff != HOMESTATE.get(key) or FORCE_UPDATE:
-            HOMESTATE[key] = onoff
+        if onoff != DEVICE_STATE.get(key) or FORCE_UPDATE:
+            DEVICE_STATE[key] = onoff
             
             topic = STATE_TOPIC.format(deviceID, state)
             mqtt_client.publish(topic, onoff.encode())
@@ -561,15 +612,15 @@ def ezville_loop(config):
  
 
     async def update_temperature(device, id1, id2, curTemp, setTemp):
-        nonlocal HOMESTATE
+        nonlocal DEVICE_STATE
         nonlocal FORCE_UPDATE
         deviceID = "{}_{:0>2d}_{:0>2d}".format(device, id1, id2)
         temperature = {'curTemp': "{}".format(str(int(curTemp, 16))), 'setTemp': "{}".format(str(int(setTemp, 16)))}
         for state in temperature:
             key = deviceID + state
             val = temperature[state]
-            if val != HOMESTATE.get(key) or FORCE_UPDATE:
-                HOMESTATE[key] = val
+            if val != DEVICE_STATE.get(key) or FORCE_UPDATE:
+                DEVICE_STATE[key] = val
                 topic = STATE_TOPIC.format(deviceID, state)
                 mqtt_client.publish(topic, val.encode())
                 
@@ -582,7 +633,7 @@ def ezville_loop(config):
     # HA에서 전달된 메시지 처리        
     async def HA_process(topics, value):
         nonlocal CMD_QUEUE
-        nonlocal ELEVUP, ELEVDOWN, GROUPON, OUTING
+#        nonlocal ELEVUP, ELEVDOWN, GROUPON, OUTING
         device_info = topics[1].split('_')
         device = device_info[0]
         
@@ -593,19 +644,31 @@ def ezville_loop(config):
             key = topics[1] + topics[2]
             idx = int(device_info[1])
             sid = int(device_info[2])
-            cur_state = HOMESTATE.get(key)
+            cur_state = DEVICE_STATE.get(key)
                         
             if cur_state == None:
                 if device == 'batch':
                     # 일괄 차단기는 4가지 모드로 조절               
                     if topics[2] == 'elevator-up':
-                        ELEVUP = '1'    
+                        ELEVUP = '1' 
+                        ELEVDOWN = '0'
+                        OUTING = '0'
+                        GROUPON = '1'
                     elif topics[2] == 'elevator-down':
+                        ELEVUP = '0' 
                         ELEVDOWN = '1'
+                        OUTING = '0'
+                        GROUPON = '1'
                     elif topics[2] == 'group':
+                        ELEVUP = '0' 
+                        ELEVDOWN = '0'
+                        OUTING = '0'
                         GROUPON = '0'
                     elif topics[2] == 'outing':
+                        ELEVUP = '0' 
+                        ELEVDOWN = '0'
                         OUTING = '1'
+                        GROUPON = '1'
                             
                     CMD = "{:0>2X}".format(int('00' + ELEVDOWN + ELEVUP + '0' + GROUPON + OUTING + '0', 2))
                     
@@ -613,7 +676,7 @@ def ezville_loop(config):
                     # 월패드의 ACK는 무시
                     sendcmd = checksum('F7' + RS485_DEVICE[device]['state']['id'] + '0' + str(idx) + RS485_DEVICE[device]['state']['cmd'] + '0300' + CMD + '000000')
                     recvcmd = 'NULL'
-                    statcmd = [key, value]
+                    statcmd = [key, 'NULL']
                     
                     CMD_QUEUE.append({'sendcmd': sendcmd, 'recvcmd': recvcmd, 'statcmd': statcmd})
                     
@@ -635,7 +698,7 @@ def ezville_loop(config):
                             CMD_QUEUE.append({'sendcmd': sendcmd, 'recvcmd': recvcmd, 'statcmd': statcmd})
                         
                         # Thermostat는 외출 모드를 Fan 모드로 연결
-                        elif value == 'fan_only':
+                        elif value == 'off':
  
                             sendcmd = checksum('F7' + RS485_DEVICE[device]['away']['id'] + '1' + str(idx) + RS485_DEVICE[device]['away']['cmd'] + '01010000')
                             recvcmd = 'F7' + RS485_DEVICE[device]['away']['id'] + '1' + str(idx) + RS485_DEVICE[device]['away']['ack']
@@ -643,13 +706,13 @@ def ezville_loop(config):
                            
                             CMD_QUEUE.append({'sendcmd': sendcmd, 'recvcmd': recvcmd, 'statcmd': statcmd})
                         
-                        elif value == 'off':
-                        
-                            sendcmd = checksum('F7' + RS485_DEVICE[device]['power']['id'] + '1' + str(idx) + RS485_DEVICE[device]['power']['cmd'] + '01000000')
-                            recvcmd = 'F7' + RS485_DEVICE[device]['power']['id'] + '1' + str(idx) + RS485_DEVICE[device]['power']['ack']
-                            statcmd = [key, value]
-                           
-                            CMD_QUEUE.append({'sendcmd': sendcmd, 'recvcmd': recvcmd, 'statcmd': statcmd})                    
+#                        elif value == 'off':
+#                        
+#                            sendcmd = checksum('F7' + RS485_DEVICE[device]['power']['id'] + '1' + str(idx) + RS485_DEVICE[device]['power']['cmd'] + '01000000')
+#                            recvcmd = 'F7' + RS485_DEVICE[device]['power']['id'] + '1' + str(idx) + RS485_DEVICE[device]['power']['ack']
+#                            statcmd = [key, value]
+#                           
+#                            CMD_QUEUE.append({'sendcmd': sendcmd, 'recvcmd': recvcmd, 'statcmd': statcmd})                    
                                                
                         if debug:
                             log('[DEBUG] Queued ::: sendcmd: {}, recvcmd: {}, statcmd: {}'.format(sendcmd, recvcmd, statcmd))
@@ -739,11 +802,15 @@ def ezville_loop(config):
                 try:
                     soc.sendall(bytes.fromhex(send_data['sendcmd']))
                 except OSError:
-                    soc = reconnect_socket(soc)
+                    soc.close()
+                    soc = initiate_socket(soc)
                     soc.sendall(bytes.fromhex(send_data['sendcmd']))
             if debug:                     
                 log('DEBUG: ' + send_data['sendcmd'] + ' ' + str(time.time()))
-                    
+             
+            if send_data['statcmd'][1] == 'NULL':
+                return
+      
             # 최소 0.2초는 ACK 처리를 기다림 (초당 30번 데이터가 들어오므로 ACK 못 받으면 시작)
             if i == 0:
                 await asyncio.sleep(0.2)
@@ -755,9 +822,9 @@ def ezville_loop(config):
                     await asyncio.sleep(CMD_INTERVAL)
                     
             if debug:
-                log('[DEBUG] Iter. No.: ' + str(i + 1) + ', Target: ' + send_data['statcmd'][1] + ', Current: ' + HOMESTATE.get(send_data['statcmd'][0]))
-                  
-            if send_data['statcmd'][1] == HOMESTATE.get(send_data['statcmd'][0]):
+                log('[DEBUG] Iter. No.: ' + str(i + 1) + ', Target: ' + send_data['statcmd'][1] + ', Current: ' + DEVICE_STATE.get(send_data['statcmd'][0]))
+              
+            if send_data['statcmd'][1] == DEVICE_STATE.get(send_data['statcmd'][0]):
                 COMMAND_LOOP_DELAY = config['command_loop_delay']
                 return
 
@@ -771,42 +838,46 @@ def ezville_loop(config):
         
     async def ew11_health_loop():
         nonlocal last_received_time
+        nonlocal restart_flag
         nonlocal EW11_TIMEOUT
         
         while True:
             timestamp = time.time()
         
             # TIMEOUT 시간 동안 새로 받은 EW11 패킷이 없으면 재시작
-            if last_received_time > 0 and timestamp - EW11_TIMEOUT > last_received_time:
+            if timestamp - last_received_time > EW11_TIMEOUT:
                 log('[WARNING] {}초간 신호를 받지 못했습니다. ew11 기기를 재시작합니다.'.format(EW11_TIMEOUT))
                 try:
-                    ew11_id = config['ew11_id']
-                    ew11_password = config['ew11_password']
-                    ew11_server = config['ew11_server']
-
-                    ew11 = telnetlib.Telnet(ew11_server)
-
-                    ew11.read_until(b"login:")
-                    ew11.write(ew11_id.encode('utf-8') + b'\n')
-                    ew11.read_until(b"password:")
-                    ew11.write(ew11_password.encode('utf-8') + b'\n')
-                    ew11.write('Restart'.encode('utf-8') + b'\n')
+                    await reset_EW11()
+                    
+                    restart_flag = True
 
                 except:
                     log('[ERROR] 기기 재시작 오류! 기기 상태를 확인하세요.')
             else:
                 log('[INFO] EW11 연결 상태 문제 없음')
             await asyncio.sleep(EW11_TIMEOUT)        
-          
+
+            
+    async def reset_EW11(): 
+        ew11_id = config['ew11_id']
+        ew11_password = config['ew11_password']
+        ew11_server = config['ew11_server']
+
+        ew11 = telnetlib.Telnet(ew11_server)
+
+        ew11.read_until(b"login:")
+        ew11.write(ew11_id.encode('utf-8') + b'\n')
+        ew11.read_until(b"password:")
+        ew11.write(ew11_password.encode('utf-8') + b'\n')
+        ew11.write('Restart'.encode('utf-8') + b'\n')
+        ew11.read_until(b"Restart..")
         
-    # MQTT 통신 시작
-    mqtt_client = mqtt.Client('mqtt-ezville')
-    mqtt_client.username_pw_set(config['mqtt_id'], config['mqtt_password'])
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_message = on_message
-    mqtt_client.connect_async(config['mqtt_server'])
-    mqtt_client.loop_start()
-    
+        log("[INFO] EW11 리셋 완료")
+        
+        # 리셋 후 60초간 Delay
+        await asyncio.sleep(60)
+        
     
     def initiate_socket():
         # SOCKET 통신 시작
@@ -825,39 +896,13 @@ def ezville_loop(config):
                 retry_count += 1
                 continue
              
+            
     def connect_socket(socket):
         nonlocal SOC_ADDRESS
         nonlocal SOC_PORT
         socket.connect((SOC_ADDRESS, SOC_PORT))
-        
-        
-    def reconnect_socket(soc):
-        soc.close()
-        
-        retry_count = 0
-        while True:
-            try:
-                soc = socket.socket()
-                soc.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                connect_socket(soc)
-                return soc
-            except ConnectionRefusedError as e:
-                log('[ERROR] Server에서 연결을 거부합니다. 재시도 예정 (' + str(retry_count) + '회 재시도)')
-                time.sleep(1)
-                retry_count += 1
-                continue
-        
-        
-    if comm_mode == 'mixed' or comm_mode == 'socket':
-        soc = initiate_socket()  
+    
 
-        
-    # Discovery 및 강제 업데이트 시간 설정
-    force_target_time = time.time() + FORCE_PERIOD
-    force_stop_time = force_target_time + FORCE_DURATION
-    
-    log('[INFO] 장치 등록 및 상태 업데이트를 시작합니다')
-    
     async def serial_recv_loop():
         nonlocal soc
         nonlocal MSG_QUEUE
@@ -880,7 +925,8 @@ def ezville_loop(config):
                 MSG_QUEUE.put(msg)
                 
             except OSError:
-                soc = reconnect_socket(soc)
+                soc.close()
+                soc = initiate_socket(soc)
          
             await asyncio.sleep(SERIAL_RECV_DELAY) 
         
@@ -925,109 +971,105 @@ def ezville_loop(config):
             # COMMAND_LOOP_DELAY 초 대기 후 루프 진행
             await asyncio.sleep(COMMAND_LOOP_DELAY)    
  
-    loop = asyncio.get_event_loop()
-    if comm_mode == 'socket':
-        loop.create_task(serial_recv_loop())
-    loop.create_task(state_update_loop())
-    loop.create_task(command_loop())
-    loop.create_task(ew11_health_loop())
-    
-    loop.run_forever()
-   
-    
-#    def serial_run():
-#        loop = asyncio.new_event_loop()
-#        asyncio.set_event_loop(loop)
 
-#        loop.run_until_complete(serial_recv_loop())
+    # EW11 재실행 시 리스타트 실시
+    async def restart_control():
+        nonlocal mqtt_client
+        nonlocal restart_flag
+        nonlocal soc
+        nonlocal DISCOVERY_LIST
+        nonlocal MQTT_ONLINE
+        nonlocal ADDON_STARTED
+        nonlocal RESTART_CHECK_DELAY
+        nonlocal REBOOT_CONTROL
         
-#    def state_run():
-#        loop = asyncio.new_event_loop()
-#        asyncio.set_event_loop(loop)
-
-#        loop.run_until_complete(state_update_loop())
-#        asyncio.run(state_update_loop())
-        
-#    def command_run():
-#        loop = asyncio.new_event_loop()
-#        asyncio.set_event_loop(loop)
-
-#        loop.run_until_complete(command_loop())
-        
-#    def ew11_run():
-#        loop = asyncio.new_event_loop()
-#        asyncio.set_event_loop(loop)
-
-#        loop.run_until_complete(ew11_health_loop())
-
- 
-#    if comm_mode == 'socket':
-#        th0 = Thread(target = serial_run())
-#        th0.start()
-        
-#    th1 = Thread(target = state_run)
-#    th2 = Thread(target = command_run)
-#    th3 = Thread(target = ew11_run)
-                 
-#    th1.start()
-#    th2.start()
-#    th3.start()
-
+        while True:
+            if restart_flag or (not MQTT_ONLINE and ADDON_STARTED and REBOOT_CONTROL):
+                if restart_flag:
+                    log("[WARNING] EW11 재시작 확인")
+                elif not MQTT_ONLINE and ADDON_STARTED and REBOOT_CONTROL:
+                    log("[WARNING] 동작 중 MQTT Integration Offline 변경")
+                
+                loop = asyncio.get_event_loop()
+                
+                # MTTQ 및 socket 연결 종료
+                log("[WARNING] 모든 통신 종료")
+                mqtt_client.loop_stop()
+                if comm_mode == 'mixed' or comm_mode == 'socket':
+                    nonlocal soc
+                    soc.close()
                        
-                         
-#    if comm_mode == 'socket':
-#        th0 = Thread(target = asyncio.run(serial_recv_loop()))
-#        th0.start()
+                # flag 원복
+                restart_flag = False
+                MQTT_ONLINE = False
+                ADDON_STARTED = False
+                
+                # DISCOVERY_LIST 삭제 (다시 DISCOVERY 시작하게 함)
+                DISCOVERY_LIST = []
+
+                # asyncio loop 종료
+                log('[WARNING] asyncio loop 종료')
+                loop.stop()
+            
+            # RESTART_CHECK_DELAY초 마다 실행
+            await asyncio.sleep(RESTART_CHECK_DELAY)
+
+            
+    # asyncio loop 획득 및 EW11 오류시 재시작 task 등록
+    loop = asyncio.get_event_loop()
+    loop.create_task(restart_control())
+
         
-#    th1 = Thread(target = asyncio.run(state_update_run()))
-#    th2 = Thread(target = asyncio.run(command_run()))
-#    th3 = Thread(target = asyncio.run(ew11_health_check()))
-                 
-#    th1.start()
-#    th2.start()
-#    th3.start()
+    # MQTT 통신
+    mqtt_client = mqtt.Client('mqtt-ezville')
+    mqtt_client.username_pw_set(config['mqtt_id'], config['mqtt_password'])
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_disconnect = on_disconnect
+    mqtt_client.on_message = on_message
+    mqtt_client.connect_async(config['mqtt_server'])
         
-#    async def main_run():
-#        nonlocal target_time, force_target_time, force_stop_time
-#        nonlocal comm_mode
-#        nonlocal DISCOVERY_MODE
-#        nonlocal FORCE_PERIOD
-#        nonlocal FORCE_DURATION
-#        nonlocal FORCE_UPDATE
-#        nonlocal LOOP_TIME
-#        
-#        while True:
-#            if comm_mode == 'socket':
-#                await asyncio.gather(
-#                    recv_from_ew11(),                    
-#                    process_message(),
-#                    send_to_ew11()
-#                )
-#            else:
-#                await asyncio.gather(
-#                    process_message(),
-#                    send_to_ew11()               
-#                )           
-#            
-#            timestamp = time.time()
-#            if timestamp > target_time and DISCOVERY_MODE:
-#                DISCOVERY_MODE = False
-#                log('IOT 제어 입력 수행을 시작합니다...')
-#            
-#            # 정해진 시간이 지나면 FORCE 모드 발동
-#            if timestamp > force_target_time and not FORCE_UPDATE:
-#                force_stop_time = timestamp + FORCE_DURATION
-#                FORCE_UPDATE = True
-#                
-#            # 정해진 시간이 지나면 FORCE 모드 종료    
-#            if timestamp > force_stop_time and FORCE_UPDATE:
-#                force_target_time = timestamp + FORCE_PERIOD
-#                FORCE_UPDATE = False
-#                
-#            # 0.02초 대기 후 루프 진행
-#            await asyncio.sleep(0.001)
-#                                                                                 
-#    asyncio.run(main_run())
+    # Discovery 및 강제 업데이트 시간 설정
+    force_target_time = time.time() + FORCE_PERIOD
+    force_stop_time = force_target_time + FORCE_DURATION
+    
+
+    while True:
+        # MQTT 통신 시작
+        mqtt_client.loop_start()
+        # MQTT Integration의 Birth/Last Will Testament를 기다림 (1초 단위)
+        while not MQTT_ONLINE and REBOOT_CONTROL:
+            time.sleep(1)
+        
+        # socket 통신 시작       
+        if comm_mode == 'mixed' or comm_mode == 'socket':
+            soc = initiate_socket()  
+
+        log('[INFO] 장치 등록 및 상태 업데이트를 시작합니다')
+
+        tasklist = []
+ 
+        # 필요시 Discovery 등의 지연을 위해 Delay 부여 
+        time.sleep(startup_delay)      
+  
+        # socket 데이터 수신 loop 실행
+        if comm_mode == 'socket':
+            tasklist.append(loop.create_task(serial_recv_loop()))
+        # EW11 패킷 기반 state 업데이트 loop 실행
+        tasklist.append(loop.create_task(state_update_loop()))
+        # Home Assistant 명령 실행 loop 실행
+        tasklist.append(loop.create_task(command_loop()))
+        # EW11 상태 체크 loop 실행
+        tasklist.append(loop.create_task(ew11_health_loop()))
+        
+        # ADDON 정상 시작 Flag 설정
+        ADDON_STARTED = True
+        loop.run_forever()
+        
+        # 이전 task는 취소
+        log("[INFO] 이전 실행 Task 종료")
+        for task in tasklist:
+            task.cancel()
+
 
 if __name__ == '__main__':
     with open(config_dir + '/options.json') as file:
